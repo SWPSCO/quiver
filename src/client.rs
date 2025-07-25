@@ -135,10 +135,24 @@ pub async fn run(
         )));
     }
 
-    info!("Connecting to nockpool at {}", server_address);
+    let remote_address = tokio::net::lookup_host(server_address.as_str())
+        .await?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses for {}", server_address))?;
+    info!("Resolved to {}", remote_address);
+
+    let host = server_address
+        .rsplitn(2, ':')
+        .last()
+        .unwrap_or(&server_address)
+        .trim_matches(|c| c == '[' || c == ']');
+
+    info!("Connecting to nockpool at {}, host: {}", server_address, host);
+
     let connection = endpoint
-        .connect(SocketAddr::from_str(&server_address)?, "nockpool")?
+        .connect(remote_address, host)?
         .await?;
+
     info!("Connected to nockpool at {}", server_address);
     let mut client = QuiverClient::new(connection, key, device_info, new_job_consumer, submission_provider, submission_response_handler);
     client.serve().await
