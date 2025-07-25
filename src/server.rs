@@ -170,7 +170,7 @@ impl QuiverInstance {
 
 pub async fn run(
     address: String,
-    cert: CertificateDer<'static>,
+    certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     authenticator: Arc<dyn Authenticator>,
     device_info_updater: Arc<dyn DeviceInfoUpdater>,
@@ -179,7 +179,7 @@ pub async fn run(
 ) -> Result<()> {
     info!("quiver listening...");
 
-    let mut config = ServerConfig::with_single_cert(vec![cert], key)?;
+    let mut config = ServerConfig::with_single_cert(certs, key)?;
 
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
