@@ -139,7 +139,6 @@ pub async fn run(
         .await?
         .next()
         .ok_or_else(|| anyhow::anyhow!("no addresses for {}", server_address))?;
-    info!("Resolved to {}", remote_address);
 
     let host = server_address
         .rsplitn(2, ':')
@@ -147,7 +146,7 @@ pub async fn run(
         .unwrap_or(&server_address)
         .trim_matches(|c| c == '[' || c == ']');
 
-    info!("Connecting to nockpool at {}, host: {}", server_address, host);
+    info!("Connecting to nockpool at {}", server_address);
 
     let connection = endpoint
         .connect(remote_address, host)?
