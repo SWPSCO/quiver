@@ -34,7 +34,7 @@ pub struct TemplateInternal {
     pub commit: Bytes,
     pub network_target: Bytes,
     pub pool_target: Bytes,
-    pub candidate_height: Bytes,
+    pub candidate_height: u32,
     pub pow_len: Bytes,
 }
 
@@ -44,7 +44,7 @@ impl TemplateInternal {
         commit: Bytes,
         network_target: Bytes,
         pool_target: Bytes,
-        candidate_height: Bytes,
+        candidate_height: u32,
         pow_len: Bytes,
     ) -> Self {
         Self {version, commit, network_target, pool_target, candidate_height, pow_len}
