@@ -79,6 +79,21 @@ impl Submission {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Announcement {
+    pub commit: Bytes,
+    pub digest: Bytes,
+    pub proof: Bytes,
+    pub candidate_height: u32,
+}
+
+impl Announcement {
+    pub fn new(commit: Bytes, digest: Bytes, proof: Bytes, candidate_height: u32) -> Self {
+        Self { commit, digest, proof, candidate_height }
+    }
+}   
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubmissionResponse {
     pub accepted: bool,
     pub digest: Bytes,
