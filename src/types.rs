@@ -17,10 +17,37 @@ pub struct Template {
     pub pool_target: Bytes,
     pub pow_len: Bytes,
 }
-
 impl Template {
     pub fn new(version: Bytes, commit: Bytes, network_target: Bytes, pool_target: Bytes, pow_len: Bytes) -> Self {
         Self {version, commit, network_target, pool_target, pow_len}
+    }
+    pub fn commit_as_base58(&self) -> Result<String, anyhow::Error> {
+        let mut slab: NounSlab = NounSlab::new();
+        let commit = slab.cue_into(self.commit.clone().into()).map_err(|_| anyhow::anyhow!("Failed to cue commit"))?;
+        tip5_hash_to_base58(commit).map_err(|_| anyhow::anyhow!("Failed to convert commit to base58"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TemplateInternal {
+    pub version: Bytes,
+    pub commit: Bytes,
+    pub network_target: Bytes,
+    pub pool_target: Bytes,
+    pub candidate_height: Bytes,
+    pub pow_len: Bytes,
+}
+
+impl TemplateInternal {
+    pub fn new(
+        version: Bytes,
+        commit: Bytes,
+        network_target: Bytes,
+        pool_target: Bytes,
+        candidate_height: Bytes,
+        pow_len: Bytes,
+    ) -> Self {
+        Self {version, commit, network_target, pool_target, candidate_height, pow_len}
     }
     pub fn commit_as_base58(&self) -> Result<String, anyhow::Error> {
         let mut slab: NounSlab = NounSlab::new();
