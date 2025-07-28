@@ -10,6 +10,13 @@ pub struct AccountInformation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Target {
+    Network,
+    Pool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Template {
     pub version: Bytes,
     pub commit: Bytes,
@@ -57,13 +64,6 @@ impl TemplateInternal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum Target {
-    Network,
-    Pool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Submission {
     pub target_type: Target,
     pub commit: Bytes,
@@ -79,6 +79,19 @@ impl Submission {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubmissionResponse {
+    pub accepted: bool,
+    pub digest: Bytes,
+    pub message: String,
+}
+
+impl SubmissionResponse {
+    pub fn new(accepted: bool, digest: Bytes, message: String) -> Self {
+        Self { accepted, digest, message }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Announcement {
     pub commit: Bytes,
     pub digest: Bytes,
@@ -89,19 +102,5 @@ pub struct Announcement {
 impl Announcement {
     pub fn new(commit: Bytes, digest: Bytes, proof: Bytes, candidate_height: u32) -> Self {
         Self { commit, digest, proof, candidate_height }
-    }
-}   
-
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SubmissionResponse {
-    pub accepted: bool,
-    pub digest: Bytes,
-    pub message: String,
-}
-
-impl SubmissionResponse {
-    pub fn new(accepted: bool, digest: Bytes, message: String) -> Self {
-        Self { accepted, digest, message }
     }
 }
