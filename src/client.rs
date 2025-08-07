@@ -6,7 +6,7 @@ use anyhow::Result;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::info;
+use tracing::{info, error};
 
 use crate::device_info::DeviceInfo;
 use crate::types::{Template, Submission, SubmissionResponse};
@@ -34,7 +34,7 @@ impl QuiverClient {
         submission_provider: Arc<dyn SubmissionProvider>,
         submission_response_handler: Arc<dyn SubmissionResponseHandler>,
     ) -> Self {
-        Self { 
+        Self {
             conn,
             key,
             device_info,
@@ -65,49 +65,80 @@ impl QuiverClient {
             return Err(anyhow::anyhow!("Device info rejected: {}", device_res));
         }
 
-        // --- Job Stream ---
-        let conn = self.conn.clone();
-        let new_job_consumer = self.new_job_consumer.clone();
-        tokio::spawn(async move {
-            if let Err(e) = receive_jobs(conn, new_job_consumer.clone()).await {
-                tracing::error!("Failed to receive jobs: {}", e);
-            }
-        });
+        info!("Client authenticated and ready for work.");
 
-        // --- Submission Stream ---
+        // Spawn the background task to receive new jobs.
+        let mut job_handle = tokio::spawn(receive_jobs(self.conn.clone(), self.new_job_consumer.clone()));
+
         loop {
-            let submission: Submission = self.submission_provider.submit().await?;
-            let conn = self.conn.clone();
-            let submission_response_handler = self.submission_response_handler.clone();
-            tokio::spawn(async move {
-                let (mut send_submission, mut recv_submission) = conn.open_bi().await.expect("failed to open submission stream");
-                let submission_bytes = bincode::serialize(&submission).expect("failed to serialize submission");
-                send_submission.write_u32(submission_bytes.len() as u32).await.expect("failed to write submission length");
-                send_submission.write_all(&submission_bytes).await.expect("failed to write submission");
-                send_submission.finish().expect("failed to finish submission");
+            tokio::select! {
+                // Use a biased select to ensure we always check for connection
+                // closure and task failure before waiting on a new submission.
+                biased;
 
-                let len = match recv_submission.read_u32().await {
-                    Ok(len) => len,
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        info!("Submission stream closed.");
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to read submission response length: {:?}", e);
-                        return;
-                    }
-                };
+                // Branch 1: The connection dies for any reason.
+                reason = self.conn.closed() => {
+                    error!("Connection closed: {:?}", reason);
+                    job_handle.abort(); // Stop the background job stream.
+                    return Err(anyhow::anyhow!("Connection closed by server or network"));
+                },
 
-                let mut res_bytes = vec![0; len as usize];
-                recv_submission.read_exact(&mut res_bytes).await.expect("failed to read submission response");
-                let res: SubmissionResponse = bincode::deserialize(&res_bytes).expect("failed to deserialize submission response");
-                if let Err(e) = submission_response_handler.handle(res).await {
-                    tracing::error!("Failed to handle submission response: {:?}", e);
-                }
-            });
+                // Branch 2: The background job receiver task fails or panics.
+                res = &mut job_handle => {
+                     match res {
+                        Ok(Ok(_)) => error!("Job stream closed unexpectedly."),
+                        Ok(Err(e)) => error!("Job stream failed: {}", e),
+                        Err(e) => error!("Job stream task panicked: {}", e),
+                     }
+                     return Err(anyhow::anyhow!("Job stream failed, disconnecting."));
+                },
+
+                // Branch 3: The submission provider (miner) has a new proof to send.
+                submission_result = self.submission_provider.submit() => {
+                    match submission_result {
+                        Ok(submission) => {
+                            let conn = self.conn.clone();
+                            let handler = self.submission_response_handler.clone();
+                            // Spawn a task to handle this specific submission.
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_one_submission(conn, submission, handler).await {
+                                    error!("Failed to process submission: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Submission provider failed critically: {}", e);
+                            job_handle.abort(); // Clean up background task.
+                            return Err(e); // Propagate critical errors.
+                        }
+                    }
+                },
+            }
         }
     }
 }
+
+/// Handle the network I/O for a single submission.
+async fn handle_one_submission(
+    conn: Connection,
+    submission: Submission,
+    handler: Arc<dyn SubmissionResponseHandler>
+) -> Result<()> {
+    let (mut send_submission, mut recv_submission) = conn.open_bi().await?;
+    let submission_bytes = bincode::serialize(&submission)?;
+    send_submission.write_u32(submission_bytes.len() as u32).await?;
+    send_submission.write_all(&submission_bytes).await?;
+    send_submission.finish()?;
+
+    let len = recv_submission.read_u32().await?;
+    let mut res_bytes = vec![0; len as usize];
+    recv_submission.read_exact(&mut res_bytes).await?;
+    let res: SubmissionResponse = bincode::deserialize(&res_bytes)?;
+    handler.handle(res).await?;
+
+    Ok(())
+}
+
 
 pub async fn run(
     insecure: bool,
@@ -163,11 +194,10 @@ async fn receive_jobs(conn: Connection, new_job_consumer: Arc<dyn NewJobConsumer
     loop {
         let len = match recv.read_u32().await {
             Ok(len) => len,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                info!("Job stream closed.");
-                return Ok(());
+            Err(e) => {
+                info!("Job stream read failed, closing: {}", e);
+                return Err(e.into());
             }
-            Err(e) => return Err(e.into()),
         };
 
         let mut buf = vec![0; len as usize];
