@@ -184,12 +184,19 @@ pub async fn run(
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
     transport.max_idle_timeout(Some(Duration::from_secs(5).try_into()?));
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(10000));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(10000));
+    transport.stream_receive_window(quinn::VarInt::from_u32(10_000_000));
+    transport.receive_window(quinn::VarInt::from_u32(10_000_000));
+    transport.send_window(10_000_000);
 
     config.transport = Arc::new(transport);
+    config.max_incoming(100000);
+    config.incoming_buffer_size(10 * 1024 * 1024);
+    config.incoming_buffer_size_total(1024 * 1024 * 1024);
 
     let endpoint = Endpoint::server(config, SocketAddr::from_str(&address)?)?;
 
-    // Start iterating over incoming connections.
     while let Some(conn) = endpoint.accept().await {
         let Ok(connection) = conn.await else {
             continue;
