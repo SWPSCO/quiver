@@ -196,7 +196,8 @@ pub async fn run(
     config.incoming_buffer_size_total(1024 * 1024 * 1024);
 
     let endpoint = Endpoint::server(config, SocketAddr::from_str(&address)?)?;
-
+    
+    // Start iterating over incoming connections.
     while let Some(conn) = endpoint.accept().await {
         let Ok(connection) = conn.await else {
             continue;
