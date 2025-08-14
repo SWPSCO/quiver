@@ -151,37 +151,41 @@ pub async fn run(
     submission_response_handler: Arc<dyn SubmissionResponseHandler>,
 ) -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let mut endpoint = Endpoint::client(SocketAddr::from_str(&client_address)?)?;
 
-    if !insecure {
-        let config = ClientConfig::with_platform_verifier();
-        endpoint.set_default_client_config(config);
-    } else {
-        let crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(SkipServerVerification::new())
-            .with_no_client_auth();
-        endpoint.set_default_client_config(ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(crypto)?,
-        )));
-    }
-
-    let remote_address = tokio::net::lookup_host(server_address.as_str())
-        .await?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses for {}", server_address))?;
-
+    // resolve/prefer ipv4
     let host = server_address
         .rsplitn(2, ':')
         .last()
         .unwrap_or(&server_address)
         .trim_matches(|c| c == '[' || c == ']');
 
-    info!("Connecting to nockpool at {}", server_address);
+    let remote_address = tokio::net::lookup_host(server_address.as_str())
+        .await?
+        .find(|a| a.is_ipv4())
+        .ok_or_else(|| anyhow::anyhow!("no IPv4 address for {}", server_address))?;
 
-    let connection = endpoint
-        .connect(remote_address, host)?
-        .await?;
+    // bind to an ipv4 socket
+    let bind_addr: SocketAddr = SocketAddr::from_str(&client_address)
+        .ok()
+        .filter(|a| a.is_ipv4())
+        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+
+    let mut endpoint = quinn::Endpoint::client(bind_addr)?;
+
+    if !insecure {
+        let config = quinn::ClientConfig::with_platform_verifier();
+        endpoint.set_default_client_config(config);
+    } else {
+        let crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(crate::insecure::SkipServerVerification::new())
+            .with_no_client_auth();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+        )));
+    }
+
+    let connection = endpoint.connect(remote_address, host)?.await?;
 
     info!("Connected to nockpool at {}", server_address);
     let mut client = QuiverClient::new(connection, key, device_info, new_job_consumer, submission_provider, submission_response_handler);
