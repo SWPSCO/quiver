@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::Result;
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Connection, Endpoint};
+use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, error};
 
@@ -155,7 +156,9 @@ pub async fn run(
 
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(10))); // send pingz
-    transport.max_idle_timeout(Some(quinn::IdleTimeout::from(Duration::from_secs(120))));
+    transport.max_idle_timeout(Some(
+        IdleTimeout::try_from(Duration::from_secs(120)).expect("idle-timeout range")
+    ));
     let transport = Arc::new(transport);
 
     // build client config then attach the transport
@@ -228,7 +231,7 @@ async fn receive_jobs(conn: quinn::Connection, new_job_consumer: Arc<dyn NewJobC
                 Err(e) => {
                     // distinguish eof vs reset vs connection-closed for diagnostics
                     use std::error::Error as _;
-                    let mut src = (&&e as &dyn std::error::Error).source();
+                    let mut src = (&e as &dyn std::error::Error).source();
                     while let Some(inner) = src {
                         if let Some(quinn::ReadError::Reset(code)) = inner.downcast_ref::<quinn::ReadError>() {
                             tracing::warn!("job stream reset by peer: {code:?}");
