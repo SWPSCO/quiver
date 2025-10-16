@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::Result;
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Connection, Endpoint};
+use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, error};
 
@@ -153,6 +154,27 @@ pub async fn run(
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut endpoint = Endpoint::client(SocketAddr::from_str(&client_address)?)?;
 
+    let mut transport = TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(10))); // send pingz
+    transport.max_idle_timeout(Some(
+        IdleTimeout::try_from(Duration::from_secs(120)).expect("idle-timeout range")
+    ));
+    let transport = Arc::new(transport);
+
+    // build client config then attach the transport
+    let mut client_cfg = if !insecure {
+        ClientConfig::with_platform_verifier()
+    } else {
+        let crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_no_client_auth();
+        ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?))
+    };
+    client_cfg.transport_config(transport);
+
+    endpoint.set_default_client_config(client_cfg);
+
     if !insecure {
         let config = ClientConfig::with_platform_verifier();
         endpoint.set_default_client_config(config);
@@ -188,21 +210,44 @@ pub async fn run(
     client.serve().await
 }
 
-async fn receive_jobs(conn: Connection, new_job_consumer: Arc<dyn NewJobConsumer>) -> Result<()> {
-    let mut recv = conn.accept_uni().await?;
-    info!("Job stream accepted.");
+async fn receive_jobs(conn: quinn::Connection, new_job_consumer: Arc<dyn NewJobConsumer>) -> Result<()> {
     loop {
-        let len = match recv.read_u32().await {
-            Ok(len) => len,
+        let mut recv = match conn.accept_uni().await {
+            Ok(s) => {
+                tracing::info!("Job stream accepted.");
+                s
+            }
             Err(e) => {
-                info!("Job stream read failed, closing: {}", e);
+                tracing::error!("accept_uni failed: {e:?}");
                 return Err(e.into());
             }
         };
 
-        let mut buf = vec![0; len as usize];
-        recv.read_exact(&mut buf).await?;
-        let template: Template = bincode::deserialize(&buf)?;
-        new_job_consumer.process(template).await?;
+        // read frames from this stream until the server finishes 
+        // or resets it then go back up and accept the next job stream.
+        loop {
+            let len = match recv.read_u32().await {
+                Ok(len) => len,
+                Err(e) => {
+                    // distinguish eof vs reset vs connection-closed for diagnostics
+                    use std::error::Error as _;
+                    let mut src = (&e as &dyn std::error::Error).source();
+                    while let Some(inner) = src {
+                        if let Some(quinn::ReadError::Reset(code)) = inner.downcast_ref::<quinn::ReadError>() {
+                            tracing::warn!("job stream reset by peer: {code:?}");
+                            break;
+                        }
+                        src = inner.source();
+                    }
+                    tracing::info!("job stream ended or failed: {e:?} — waiting for next stream");
+                    break; // break inner loop, accept a new uni stream
+                }
+            };
+
+            let mut buf = vec![0; len as usize];
+            recv.read_exact(&mut buf).await?;
+            let template: Template = bincode::deserialize(&buf)?;
+            new_job_consumer.process(template).await?;
+        }
     }
 }
