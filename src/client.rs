@@ -49,7 +49,9 @@ impl QuiverClient {
         // --- Authentication Transaction ---
         info!("authenticating...");
         let (mut send_auth, mut recv_auth) = self.conn.open_bi().await?;
-        send_auth.write_all(self.key.as_bytes()).await?;
+        let api_key_bytes = self.key.as_bytes();
+        send_auth.write_u32(api_key_bytes.len() as u32).await?;
+        send_auth.write_all(api_key_bytes).await?;
         send_auth.finish()?;
         let auth_res = String::from_utf8(recv_auth.read_to_end(50).await?)?;
         if auth_res != "authenticated" {
@@ -59,7 +61,9 @@ impl QuiverClient {
         // --- Device Info Transaction ---
         info!("sending device info...");
         let (mut send_device, mut recv_device) = self.conn.open_bi().await?;
-        send_device.write_all(&bincode::serialize(&self.device_info)?).await?;
+        let device_info_bytes = bincode::serialize(&self.device_info)?;
+        send_device.write_u32(device_info_bytes.len() as u32).await?;
+        send_device.write_all(&device_info_bytes).await?;
         send_device.finish()?;
         let device_res = String::from_utf8(recv_device.read_to_end(50).await?)?;
         if device_res != "accepted" {
