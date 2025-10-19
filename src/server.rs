@@ -83,17 +83,16 @@ impl QuiverInstance {
         let Ok((mut send, mut recv)) = self.conn.accept_bi().await else {
             return Err(anyhow::anyhow!("connection closed before device info"));
         };
-
-        //  Read the length first and enforce limit
         let len = recv.read_u32().await?;
         if len > MAX_DEVICE_INFO_SIZE {
-            return Err(anyhow::anyhow!("Received device info exceeds size limit"));
+            return Err(anyhow::anyhow!("Device info size of {} exceeds limit of {}", len, MAX_DEVICE_INFO_SIZE));
         }
-
-        // Read the exact number of bytes
-        let mut buf = vec![0; len as usize];
-        recv.read_exact(&mut buf).await?;
-        let device_info = bincode::deserialize::<DeviceInfo>(&buf)?;
+        if len == 0 {
+            return Err(anyhow::anyhow!("Received empty device info."));
+        }
+        let mut device_info_bytes = vec![0; len as usize];
+        recv.read_exact(&mut device_info_bytes).await?;
+        let device_info = bincode::deserialize::<DeviceInfo>(&device_info_bytes)?;
         let Some(api_key) = self.api_key.clone() else {
             return Err(anyhow::anyhow!("no api key"));
         };
