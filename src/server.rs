@@ -47,12 +47,20 @@ impl QuiverInstance {
     }
 
     async fn handle_auth_stream(&mut self) -> Result<bool> {
+        const MAX_AUTH_TOKEN: u32 = 128;
         let Ok((mut send, mut recv)) = self.conn.accept_bi().await else {
             return Err(anyhow::anyhow!("connection closed before auth"));
         };
-
-        let api_key = String::from_utf8(recv.read_to_end(50).await?)?;
-
+        let len = recv.read_u32().await?;
+        if len > MAX_AUTH_TOKEN {
+            return Err(anyhow::anyhow!("API key size of {} exceeds limit of {}", len, MAX_AUTH_TOKEN));
+        }
+        if len == 0 {
+            return Err(anyhow::anyhow!("Received an empty API key."));
+        }
+        let mut api_key_bytes = vec![0; len as usize];
+        recv.read_exact(&mut api_key_bytes).await?;
+        let api_key = String::from_utf8(api_key_bytes)?;
         match self.authenticator.authenticate(&api_key).await {
             Ok((account_information, guard)) => {
                 self.account_information = Some(account_information);
@@ -71,11 +79,21 @@ impl QuiverInstance {
     }
 
     async fn handle_device_info_stream(&mut self) -> Result<bool> {
+        const MAX_DEVICE_INFO_SIZE: u32 = 4096; // 4 KB limit
         let Ok((mut send, mut recv)) = self.conn.accept_bi().await else {
             return Err(anyhow::anyhow!("connection closed before device info"));
         };
 
-        let device_info = bincode::deserialize::<DeviceInfo>(&recv.read_to_end(1024).await?)?;
+        //  Read the length first and enforce limit
+        let len = recv.read_u32().await?;
+        if len > MAX_DEVICE_INFO_SIZE {
+            return Err(anyhow::anyhow!("Received device info exceeds size limit"));
+        }
+
+        // Read the exact number of bytes
+        let mut buf = vec![0; len as usize];
+        recv.read_exact(&mut buf).await?;
+        let device_info = bincode::deserialize::<DeviceInfo>(&buf)?;
         let Some(api_key) = self.api_key.clone() else {
             return Err(anyhow::anyhow!("no api key"));
         };
