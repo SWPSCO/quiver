@@ -47,14 +47,10 @@ impl QuiverInstance {
     }
 
     async fn handle_auth_stream(&mut self) -> Result<bool> {
-        const MAX_AUTH_TOKEN: u32 = 128;
         let Ok((mut send, mut recv)) = self.conn.accept_bi().await else {
             return Err(anyhow::anyhow!("connection closed before auth"));
         };
         let len = recv.read_u32().await?;
-        if len > MAX_AUTH_TOKEN {
-            return Err(anyhow::anyhow!("API key size of {} exceeds limit of {}", len, MAX_AUTH_TOKEN));
-        }
         if len == 0 {
             return Err(anyhow::anyhow!("Received an empty API key."));
         }
@@ -79,14 +75,10 @@ impl QuiverInstance {
     }
 
     async fn handle_device_info_stream(&mut self) -> Result<bool> {
-        const MAX_DEVICE_INFO_SIZE: u32 = 4096; // 4 KB limit
         let Ok((mut send, mut recv)) = self.conn.accept_bi().await else {
             return Err(anyhow::anyhow!("connection closed before device info"));
         };
         let len = recv.read_u32().await?;
-        if len > MAX_DEVICE_INFO_SIZE {
-            return Err(anyhow::anyhow!("Device info size of {} exceeds limit of {}", len, MAX_DEVICE_INFO_SIZE));
-        }
         if len == 0 {
             return Err(anyhow::anyhow!("Received empty device info."));
         }
