@@ -200,7 +200,7 @@ pub async fn run(
 
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
-    transport.max_idle_timeout(Some(Duration::from_secs(5).try_into()?));
+    transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(50));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(50));
     transport.stream_receive_window(quinn::VarInt::from_u32(10_000_000));
