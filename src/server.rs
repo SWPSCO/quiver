@@ -46,41 +46,203 @@ impl QuiverInstance {
             submission_consumer,
         }
     }
+    
+    const TOKEN_PREFIX: u32 = 0x6e6f636b; // nock
 
-    async fn handle_device_info_stream(&mut self) -> Result<bool> {
+    pub async fn serve(&mut self) -> Result<()> {
+        // First bidi stream: either legacy auth (v0) or version handshake (v1+)
+        let (mut send0, mut recv0) = self.conn.accept_bi().await?;
+
+        // Peek first 4 bytes as u32 (legacy "nock" or length of version blob)
+        let first_u32 = recv0.read_u32().await;
+
+        match first_u32 {
+            Ok(x) if x == Self::TOKEN_PREFIX => {
+                // v0 legacy path
+                self.serve_v1(send0, recv0).await
+            }
+            Ok(len) => {
+                // v1+ path (len = size of ProtocolVersion)
+                self.serve_v2(send0, recv0, len).await
+            }
+            Err(e) => {
+                error!("Failed to read initial handshake bytes: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// v0 (legacy) protocol:
+    /// - First stream carries the API key (raw, no length prefix), starting with "nock"
+    /// - Reply on same stream with raw "authenticated"/"unauthorized"
+    /// - Device info stream: raw bincode (no length), raw "accepted"/"rejected"
+    async fn serve_v1(
+        &mut self,
+        mut send0: quinn::SendStream,
+        mut recv0: quinn::RecvStream,
+    ) -> Result<()> {
+        warn!("Legacy authentication, no version handshake. Please update your miner!");
+        // rebuild the full token:
+        let mut key = Self::TOKEN_PREFIX.to_be_bytes().to_vec();
+        key.extend(recv0.read_to_end(50 - 4).await?);
+        let api_key = String::from_utf8(key)?;
+
+        // Authenticate & reply on same stream
+        match self.authenticator.authenticate(&api_key).await {
+            Ok((acct, guard)) => {
+                self.account_information = Some(acct);
+                self.connection_guard = Some(guard);
+                self.api_key = Some(api_key);
+                send0.write_all(b"authenticated").await?;
+                send0.finish()?;
+            }
+            Err(e) => {
+                let _ = send0.write_all(b"unauthorized").await;
+                let _ = send0.finish();
+                return Err(e);
+            }
+        }
+
+        // Device info (legacy)
+        if !self.handle_device_info_stream(false).await? {
+            return Err(anyhow::anyhow!("Device info rejected"));
+        }
+
+        self.after_ready_then_work().await
+    }
+
+    /// v2 protocol:
+    /// - First stream is version handshake (len-prefixed bincode<ProtocolVersion>), reply "ok" (len-prefixed)
+    /// - Second stream carries API key (len-prefixed), reply len-prefixed "authenticated"/"unauthorized"
+    /// - Device info stream: len-prefixed bincode, len-prefixed "accepted"/"rejected"
+    async fn serve_v2(
+        &mut self,
+        mut send0: quinn::SendStream,
+        mut recv0: quinn::RecvStream,
+        ver_len: u32,
+    ) -> Result<()> {
+        // Read version struct
+        if ver_len == 0 || ver_len >= 100 {
+            return Err(anyhow::anyhow!("Invalid protocol handshake length: {}", ver_len));
+        }
+        let mut ver_buf = vec![0; ver_len as usize];
+        recv0.read_exact(&mut ver_buf).await
+            .map_err(|_| anyhow::anyhow!("Malformed protocol handshake. Please update your miner."))?;
+        let client_v: ProtocolVersion = bincode::deserialize(&ver_buf)
+            .map_err(|_| anyhow::anyhow!("Malformed protocol handshake."))?;
+        if client_v.major != CURRENT_VERSION.major {
+            return Err(anyhow::anyhow!("Incompatible protocol version"));
+        }
+        info!("Handshake successful: v{}.{}.{}", client_v.major, client_v.minor, client_v.patch);
+        // Send len-prefixed "ok" and finish handshake stream
+        Self::lp_write(&mut send0, b"ok").await?;
+        send0.finish()?;
+
+        // Auth stream
+        let (mut send_auth, mut recv_auth) = self.conn.accept_bi().await?;
+        let key = Self::lp_read(&mut recv_auth, 256).await?; // cap 256B
+        let api_key = String::from_utf8(key)?;
+
+        match self.authenticator.authenticate(&api_key).await {
+            Ok((acct, guard)) => {
+                self.account_information = Some(acct);
+                self.connection_guard = Some(guard);
+                self.api_key = Some(api_key);
+                Self::lp_write(&mut send_auth, b"authenticated").await?;
+                send_auth.finish()?;
+            }
+            Err(e) => {
+                let _ = Self::lp_write(&mut send_auth, b"unauthorized").await;
+                let _ = send_auth.finish();
+                return Err(e);
+            }
+        }
+
+        // Device info v2
+        if !self.handle_device_info_stream(true).await? {
+            return Err(anyhow::anyhow!("Device info rejected"));
+        }
+
+        self.after_ready_then_work().await
+    }
+
+    async fn after_ready_then_work(&mut self) -> Result<()> {
+        let truncated_api_key = self
+            .api_key
+            .as_ref()
+            .unwrap()
+            .chars()
+            .rev()
+            .take(8)
+            .collect::<String>();
+
+        info!(
+            "{:?} device key {:?} put to work",
+            self.account_information.as_ref().unwrap().user_uuid,
+            truncated_api_key
+        );
+
+        self.handle_work().await
+    }
+
+    /// len_prefixed: v2, expect/read/write length-prefixed frames
+    /// !len_prefixed: v1, legacy raw frames
+    async fn handle_device_info_stream(&mut self, len_prefixed: bool) -> Result<bool> {
         let Ok((mut send, mut recv)) = self.conn.accept_bi().await else {
             return Err(anyhow::anyhow!("connection closed before device info"));
         };
 
-        let len = recv.read_u32().await?;
-        if len == 0 || len > 1_000_000 {
-            return Err(anyhow::anyhow!("Device info size out of bounds: {}", len));
-        }
+        // Read device info bytes
+        let device_info_bytes = if len_prefixed {
+            Self::lp_read(&mut recv, 1_000_000).await? // 1MB cap
+        } else {
+            // legacy raw bincode, small bound
+            recv.read_to_end(4096).await?
+        };
 
-        let mut device_info_bytes = vec![0; len as usize];
-        recv.read_exact(&mut device_info_bytes).await?;
         let device_info = bincode::deserialize::<DeviceInfo>(&device_info_bytes)?;
-
         let Some(api_key) = self.api_key.clone() else {
             return Err(anyhow::anyhow!("no api key"));
         };
 
+        // update & reply in matching format
         match self.device_info_updater.update_device_info(&device_info, &api_key).await {
             Ok(_) => {
-                let msg = b"accepted";
-                send.write_u32(msg.len() as u32).await?;
-                send.write_all(msg).await?;
+                if len_prefixed {
+                    Self::lp_write(&mut send, b"accepted").await?;
+                } else {
+                    send.write_all(b"accepted").await?;
+                }
                 send.finish()?;
                 Ok(true)
             }
             Err(_) => {
-                let msg = b"rejected";
-                send.write_u32(msg.len() as u32).await?;
-                send.write_all(msg).await?;
+                if len_prefixed {
+                    Self::lp_write(&mut send, b"rejected").await?;
+                } else {
+                    send.write_all(b"rejected").await?;
+                }
                 send.finish()?;
                 Ok(false)
             }
         }
+    }
+
+    //  helpers for v2 length-prefixed messages
+    async fn lp_read(recv: &mut quinn::RecvStream, max_len: u32) -> Result<Vec<u8>> {
+        let n = recv.read_u32().await?;
+        if n == 0 || n > max_len {
+            return Err(anyhow::anyhow!("frame size out of bounds: {}", n));
+        }
+        let mut buf = vec![0; n as usize];
+        recv.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
+    async fn lp_write(send: &mut quinn::SendStream, bytes: &[u8]) -> Result<()> {
+        send.write_u32(bytes.len() as u32).await?;
+        send.write_all(bytes).await?;
+        Ok(())
     }
 
     async fn handle_work(&mut self) -> Result<()> {
@@ -136,124 +298,6 @@ impl QuiverInstance {
         }
         Ok(())
     }
-
-    async fn serve(&mut self) -> Result<()> {
-        // First bidi stream: version handshake OR legacy auth
-        let (mut send0, mut recv0) = self.conn.accept_bi().await?;
-        const TOKEN_PREFIX: u32 = 1852793707;
-
-        let first_u32 = recv0.read_u32().await;
-        match first_u32 {
-            // ----- LEGACY: API key in first stream -----
-            Ok(TOKEN_PREFIX) => {
-                warn!("Legacy authentication, no version handshake. Please update your miner!");
-                let mut key = TOKEN_PREFIX.to_be_bytes().to_vec();
-                key.extend(recv0.read_to_end(50 - 4).await?);
-                let api_key = String::from_utf8(key)?;
-
-                match self.authenticator.authenticate(&api_key).await {
-                    Ok((acct, guard)) => {
-                        self.account_information = Some(acct);
-                        self.connection_guard = Some(guard);
-                        self.api_key = Some(api_key);
-                        let msg = b"authenticated";
-                        send0.write_u32(msg.len() as u32).await?;
-                        send0.write_all(msg).await?;
-                        send0.finish()?;
-                    }
-                    Err(e) => {
-                        let msg = b"unauthorized";
-                        let _ = send0.write_u32(msg.len() as u32).await;
-                        let _ = send0.write_all(msg).await;
-                        let _ = send0.finish();
-                        return Err(e);
-                    }
-                }
-
-                if !self.handle_device_info_stream().await? {
-                    return Err(anyhow::anyhow!("Device info rejected"));
-                }
-            }
-
-            // ----- NEW PROTOCOL: version then separate auth stream -----
-            Ok(len) => {
-                if len == 0 || len >= 100 {
-                    return Err(anyhow::anyhow!("Invalid protocol handshake length: {}", len));
-                }
-                let mut ver_buf = vec![0; len as usize];
-                recv0.read_exact(&mut ver_buf).await
-                    .map_err(|_| anyhow::anyhow!("Malformed protocol handshake. Please update your miner."))?;
-                let client_v: ProtocolVersion = bincode::deserialize(&ver_buf)
-                    .map_err(|_| anyhow::anyhow!("Malformed protocol handshake."))?;
-
-                if client_v.major != CURRENT_VERSION.major {
-                    return Err(anyhow::anyhow!("Incompatible protocol version"));
-                }
-
-                info!("Handshake successful: v{}.{}.{}", client_v.major, client_v.minor, client_v.patch);
-
-                // send length-prefixed "ok" and finish handshake stream
-                let ok = b"ok";
-                send0.write_u32(ok.len() as u32).await?;
-                send0.write_all(ok).await?;
-                send0.finish()?;
-
-                // Auth stream: read key, authenticate, reply, finish.
-                let (mut send_auth, mut recv_auth) = self.conn.accept_bi().await?;
-                let key_len = recv_auth.read_u32().await?;
-                if key_len > 256 {
-                    let msg = b"invalid_key_len";
-                    let _ = send_auth.write_u32(msg.len() as u32).await;
-                    let _ = send_auth.write_all(msg).await;
-                    let _ = send_auth.finish();
-                    return Err(anyhow::anyhow!("Protocol error: key size {} exceeds 256", key_len));
-                }
-                let mut key_bytes = vec![0; key_len as usize];
-                recv_auth.read_exact(&mut key_bytes).await?;
-                let api_key = String::from_utf8(key_bytes)?;
-
-                match self.authenticator.authenticate(&api_key).await {
-                    Ok((acct, guard)) => {
-                        self.account_information = Some(acct);
-                        self.connection_guard = Some(guard);
-                        self.api_key = Some(api_key);
-                        let msg = b"authenticated";
-                        send_auth.write_u32(msg.len() as u32).await?;
-                        send_auth.write_all(msg).await?;
-                        send_auth.finish()?;
-                    }
-                    Err(e) => {
-                        let msg = b"unauthorized";
-                        let _ = send_auth.write_u32(msg.len() as u32).await;
-                        let _ = send_auth.write_all(msg).await;
-                        let _ = send_auth.finish();
-                        return Err(e);
-                    }
-                }
-
-                // Device-info stream (next bidi)
-                if !self.handle_device_info_stream().await? {
-                    return Err(anyhow::anyhow!("Device info rejected"));
-                }
-            }
-
-            Err(e) => {
-                error!("Failed to read initial handshake bytes: {}", e);
-                return Err(e.into());
-            }
-        }
-
-        // Ready for work
-        let truncated_api_key = self.api_key.as_ref().unwrap().chars().rev().take(8).collect::<String>();
-        info!(
-            "{:?} device key {:?} put to work",
-            self.account_information.as_ref().unwrap().user_uuid,
-            truncated_api_key
-        );
-
-        self.handle_work().await
-    }
-
 }
 
 pub async fn run(
