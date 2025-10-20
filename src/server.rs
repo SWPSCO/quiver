@@ -51,30 +51,38 @@ impl QuiverInstance {
         let Ok((mut send, mut recv)) = self.conn.accept_bi().await else {
             return Err(anyhow::anyhow!("connection closed before device info"));
         };
+
         let len = recv.read_u32().await?;
-        if len == 0 {
-            return Err(anyhow::anyhow!("Received empty device info."));
+        if len == 0 || len > 1_000_000 {
+            return Err(anyhow::anyhow!("Device info size out of bounds: {}", len));
         }
+
         let mut device_info_bytes = vec![0; len as usize];
         recv.read_exact(&mut device_info_bytes).await?;
         let device_info = bincode::deserialize::<DeviceInfo>(&device_info_bytes)?;
+
         let Some(api_key) = self.api_key.clone() else {
             return Err(anyhow::anyhow!("no api key"));
         };
 
         match self.device_info_updater.update_device_info(&device_info, &api_key).await {
             Ok(_) => {
-                send.write_all(b"accepted").await?;
+                let msg = b"accepted";
+                send.write_u32(msg.len() as u32).await?;
+                send.write_all(msg).await?;
                 send.finish()?;
                 Ok(true)
             }
             Err(_) => {
-                send.write_all(b"rejected").await?;
+                let msg = b"rejected";
+                send.write_u32(msg.len() as u32).await?;
+                send.write_all(msg).await?;
                 send.finish()?;
                 Ok(false)
             }
         }
     }
+
     async fn handle_work(&mut self) -> Result<()> {
         // New job pusher
         let new_job_provider = self.new_job_provider.clone();
@@ -130,43 +138,44 @@ impl QuiverInstance {
     }
 
     async fn serve(&mut self) -> Result<()> {
-        // 1) First bidi stream: version handshake OR legacy auth
+        // First bidi stream: version handshake OR legacy auth
         let (mut send0, mut recv0) = self.conn.accept_bi().await?;
         const TOKEN_PREFIX: u32 = 1852793707;
 
         let first_u32 = recv0.read_u32().await;
         match first_u32 {
-            // ----- LEGACY PATH: API key on first stream -----
+            // ----- LEGACY: API key in first stream -----
             Ok(TOKEN_PREFIX) => {
                 warn!("Legacy authentication, no version handshake. Please update your miner!");
-                // Read the rest of the API key from the same stream.
                 let mut key = TOKEN_PREFIX.to_be_bytes().to_vec();
                 key.extend(recv0.read_to_end(50 - 4).await?);
                 let api_key = String::from_utf8(key)?;
 
-                // Auth on the same stream
                 match self.authenticator.authenticate(&api_key).await {
                     Ok((acct, guard)) => {
                         self.account_information = Some(acct);
                         self.connection_guard = Some(guard);
                         self.api_key = Some(api_key);
-                        send0.write_all(b"authenticated").await?;
+                        let msg = b"authenticated";
+                        send0.write_u32(msg.len() as u32).await?;
+                        send0.write_all(msg).await?;
                         send0.finish()?;
                     }
                     Err(e) => {
-                        let _ = send0.write_all(b"unauthorized").await;
+                        let msg = b"unauthorized";
+                        let _ = send0.write_u32(msg.len() as u32).await;
+                        let _ = send0.write_all(msg).await;
                         let _ = send0.finish();
                         return Err(e);
                     }
                 }
 
-                // Device-info stream (next bidi)
                 if !self.handle_device_info_stream().await? {
                     return Err(anyhow::anyhow!("Device info rejected"));
                 }
             }
 
-            // ----- NEW PROTOCOL: version handshake, then separate auth stream -----
+            // ----- NEW PROTOCOL: version then separate auth stream -----
             Ok(len) => {
                 if len == 0 || len >= 100 {
                     return Err(anyhow::anyhow!("Invalid protocol handshake length: {}", len));
@@ -176,24 +185,28 @@ impl QuiverInstance {
                     .map_err(|_| anyhow::anyhow!("Malformed protocol handshake. Please update your miner."))?;
                 let client_v: ProtocolVersion = bincode::deserialize(&ver_buf)
                     .map_err(|_| anyhow::anyhow!("Malformed protocol handshake."))?;
+
                 if client_v.major != CURRENT_VERSION.major {
                     return Err(anyhow::anyhow!("Incompatible protocol version"));
                 }
+
                 info!("Handshake successful: v{}.{}.{}", client_v.major, client_v.minor, client_v.patch);
-                // Complete the handshake stream so client's read_to_end returns.
-                send0.write_all(b"ok").await?;
+
+                // send length-prefixed "ok" and finish handshake stream
+                let ok = b"ok";
+                send0.write_u32(ok.len() as u32).await?;
+                send0.write_all(ok).await?;
                 send0.finish()?;
 
-                // 2) Auth stream: read key, authenticate, reply in same stream, finish stream.
+                // Auth stream: read key, authenticate, reply, finish.
                 let (mut send_auth, mut recv_auth) = self.conn.accept_bi().await?;
                 let key_len = recv_auth.read_u32().await?;
                 if key_len > 256 {
-                    let _ = send_auth.write_all(b"invalid_key_len").await;
+                    let msg = b"invalid_key_len";
+                    let _ = send_auth.write_u32(msg.len() as u32).await;
+                    let _ = send_auth.write_all(msg).await;
                     let _ = send_auth.finish();
-                    return Err(anyhow::anyhow!(
-                        "Protocol error: new client key size {} exceeds limit of 256",
-                        key_len
-                    ));
+                    return Err(anyhow::anyhow!("Protocol error: key size {} exceeds 256", key_len));
                 }
                 let mut key_bytes = vec![0; key_len as usize];
                 recv_auth.read_exact(&mut key_bytes).await?;
@@ -204,17 +217,21 @@ impl QuiverInstance {
                         self.account_information = Some(acct);
                         self.connection_guard = Some(guard);
                         self.api_key = Some(api_key);
-                        send_auth.write_all(b"authenticated").await?;
+                        let msg = b"authenticated";
+                        send_auth.write_u32(msg.len() as u32).await?;
+                        send_auth.write_all(msg).await?;
                         send_auth.finish()?;
                     }
                     Err(e) => {
-                        let _ = send_auth.write_all(b"unauthorized").await;
+                        let msg = b"unauthorized";
+                        let _ = send_auth.write_u32(msg.len() as u32).await;
+                        let _ = send_auth.write_all(msg).await;
                         let _ = send_auth.finish();
                         return Err(e);
                     }
                 }
 
-                // 3) Device-info stream
+                // Device-info stream (next bidi)
                 if !self.handle_device_info_stream().await? {
                     return Err(anyhow::anyhow!("Device info rejected"));
                 }
@@ -226,7 +243,7 @@ impl QuiverInstance {
             }
         }
 
-        // From here on, you’re authenticated and device info is accepted.
+        // Ready for work
         let truncated_api_key = self.api_key.as_ref().unwrap().chars().rev().take(8).collect::<String>();
         info!(
             "{:?} device key {:?} put to work",

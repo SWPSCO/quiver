@@ -54,77 +54,85 @@ impl QuiverClient {
         send_version.write_all(&ver_bytes).await?;
         send_version.finish()?;
 
-        let response = String::from_utf8(recv_version.read_to_end(100).await?)?;
+        // read length-prefixed "ok"
+        let ok_len = recv_version.read_u32().await?;
+        let mut ok_buf = vec![0; ok_len as usize];
+        recv_version.read_exact(&mut ok_buf).await?;
+        let response = String::from_utf8(ok_buf)?;
+
         if response != "ok" {
             return Err(anyhow::anyhow!("Protocol negotiation failed: {}", response));
         }
-
         info!("Protocol version compatible with server.");
         Ok(())
     }
 
     async fn serve(&mut self) -> Result<()> {
-        // attempt version handshake
+        // 1) Version handshake
         self.perform_version_handshake().await?;
-        // --- Authentication Transaction ---
+
+        // 2) Authentication
         info!("authenticating...");
         let (mut send_auth, mut recv_auth) = self.conn.open_bi().await?;
         let api_key_bytes = self.key.as_bytes();
         send_auth.write_u32(api_key_bytes.len() as u32).await?;
         send_auth.write_all(api_key_bytes).await?;
         send_auth.finish()?;
-        let auth_res = String::from_utf8(recv_auth.read_to_end(50).await?)?;
+
+        // read length-prefixed auth reply
+        let n = recv_auth.read_u32().await?;
+        let mut buf = vec![0; n as usize];
+        recv_auth.read_exact(&mut buf).await?;
+        let auth_res = String::from_utf8(buf)?;
         if auth_res != "authenticated" {
             return Err(anyhow::anyhow!("Authentication failed: {}", auth_res));
         }
 
-        // --- Device Info Transaction ---
+        // 3) Device info
         info!("sending device info...");
         let (mut send_device, mut recv_device) = self.conn.open_bi().await?;
         let device_info_bytes = bincode::serialize(&self.device_info)?;
         send_device.write_u32(device_info_bytes.len() as u32).await?;
         send_device.write_all(&device_info_bytes).await?;
         send_device.finish()?;
-        let device_res = String::from_utf8(recv_device.read_to_end(50).await?)?;
+
+        // read length-prefixed device-info reply
+        let n = recv_device.read_u32().await?;
+        let mut buf = vec![0; n as usize];
+        recv_device.read_exact(&mut buf).await?;
+        let device_res = String::from_utf8(buf)?;
         if device_res != "accepted" {
             return Err(anyhow::anyhow!("Device info rejected: {}", device_res));
         }
 
         info!("Client authenticated and ready for work.");
 
-        // Spawn the background task to receive new jobs.
+        // --- Your existing loop unchanged ---
         let mut job_handle = tokio::spawn(receive_jobs(self.conn.clone(), self.new_job_consumer.clone()));
-
         loop {
             tokio::select! {
-                // Use a biased select to ensure we always check for connection
-                // closure and task failure before waiting on a new submission.
                 biased;
 
-                // Branch 1: The connection dies for any reason.
                 reason = self.conn.closed() => {
                     error!("Connection closed: {:?}", reason);
-                    job_handle.abort(); // Stop the background job stream.
+                    job_handle.abort();
                     return Err(anyhow::anyhow!("Connection closed by server or network"));
                 },
 
-                // Branch 2: The background job receiver task fails or panics.
                 res = &mut job_handle => {
-                     match res {
+                    match res {
                         Ok(Ok(_)) => error!("Job stream closed unexpectedly."),
                         Ok(Err(e)) => error!("Job stream failed: {}", e),
                         Err(e) => error!("Job stream task panicked: {}", e),
-                     }
-                     return Err(anyhow::anyhow!("Job stream failed, disconnecting."));
+                    }
+                    return Err(anyhow::anyhow!("Job stream failed, disconnecting."));
                 },
 
-                // Branch 3: The submission provider (miner) has a new proof to send.
                 submission_result = self.submission_provider.submit() => {
                     match submission_result {
                         Ok(submission) => {
                             let conn = self.conn.clone();
                             let handler = self.submission_response_handler.clone();
-                            // Spawn a task to handle this specific submission.
                             tokio::spawn(async move {
                                 if let Err(e) = handle_one_submission(conn, submission, handler).await {
                                     error!("Failed to process submission: {}", e);
@@ -133,8 +141,8 @@ impl QuiverClient {
                         }
                         Err(e) => {
                             error!("Submission provider failed critically: {}", e);
-                            job_handle.abort(); // Clean up background task.
-                            return Err(e); // Propagate critical errors.
+                            job_handle.abort();
+                            return Err(e);
                         }
                     }
                 },
