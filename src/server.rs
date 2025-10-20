@@ -130,52 +130,62 @@ impl QuiverInstance {
     }
 
     async fn serve(&mut self) -> Result<()> {
-        // The first stream must handle both versioning and auth for backward compatibility
+        // First stream: version (or legacy auth)
         let (mut send, mut recv) = self.conn.accept_bi().await?;
-        // heuristic to determine whether this is a handshake or legacy auth attempt
-        let initial_bytes = recv.read_u32().await;
+        let initial = recv.read_u32().await;
         const TOKEN_PREFIX: u32 = 1852793707;
-
-        // We should remove this in the future
-        let api_key_bytes = match initial_bytes {
+        let mut send_auth_opt: Option<quinn::SendStream> = None;
+        let api_key_bytes: Vec<u8> = match initial {
+            // --- Legacy: API key was sent on the first stream ---
             Ok(TOKEN_PREFIX) => {
                 warn!("Legacy authentication, no version handshake. Please update your miner!");
-                let mut key_bytes = TOKEN_PREFIX.to_be_bytes().to_vec();
-                key_bytes.extend(recv.read_to_end(50 - 4).await?);
-                key_bytes
-            },
-            // assume this is a version handshake
+                // In legacy mode we reply on the same stream, so keep `send` as send_auth.
+                send_auth_opt = Some(send);
+                let mut key = TOKEN_PREFIX.to_be_bytes().to_vec();
+                key.extend(recv.read_to_end(50 - 4).await?);
+                key
+            }
+
+            // --- New protocol: version handshake, then separate auth stream ---
             Ok(len) => {
-                if len > 0 && len < 100 {
-                    let mut ver_bytes = vec![0; len as usize];
-                    match recv.read_exact(&mut ver_bytes).await {
-                        Ok(_) => {
-                            match bincode::deserialize::<ProtocolVersion>(&ver_bytes) {
-                                // Deserialized correctly and the major version matches
-                                // If we have incompatible protocol changes in the future, fork here
-                                Ok(client_version) if client_version.major == CURRENT_VERSION.major => {
-                                    info!("Handshake successful: v{}.{}.{}", client_version.major, client_version.minor, client_version.patch);
-                                    send.write_all(b"ok").await?;
-                                    send.finish()?;
-                                    let (_send_auth, mut recv_auth) = self.conn.accept_bi().await?;
-                                    let key_len = recv_auth.read_u32().await?;
-                                    // Check length
-                                    if key_len > 256 {
-                                        return Err(anyhow::anyhow!("Protocol error: new client key size of {} exceeds limit of 256", key_len));
-                                    }
-                                    let mut key_bytes = vec![0; key_len as usize];
-                                    recv_auth.read_exact(&mut key_bytes).await?;
-                                    key_bytes
-                                },
-                                _ => return Err(anyhow::anyhow!("Incompatible protocol version or malformed handshake")),
-                            }
-                        },
-                        Err(_) => return Err(anyhow::anyhow!("Malformed protocol handshake. Please update your miner.")),
-                    }
-                } else {
+                if len == 0 || len >= 100 {
                     return Err(anyhow::anyhow!("Invalid protocol handshake length: {}", len));
                 }
-            },
+                let mut ver_bytes = vec![0; len as usize];
+                recv.read_exact(&mut ver_bytes).await
+                    .map_err(|_| anyhow::anyhow!("Malformed protocol handshake. Please update your miner."))?;
+                match bincode::deserialize::<ProtocolVersion>(&ver_bytes) {
+                    Ok(client_v) if client_v.major == CURRENT_VERSION.major => {
+                        info!("Handshake successful: v{}.{}.{}", client_v.major, client_v.minor, client_v.patch);
+                        // Complete the handshake stream so the client’s read_to_end() returns.
+                        send.write_all(b"ok").await?;
+                        send.finish()?;
+
+                        // Now accept auth stream
+                        let (mut send_auth, mut recv_auth) = self.conn.accept_bi().await?;
+                        // keep the send half so we can reply later
+                        send_auth_opt = Some(send_auth);
+
+                        let key_len = recv_auth.read_u32().await?;
+                        if key_len > 256 {
+                            // Send an explicit failure and bail
+                            if let Some(mut s) = send_auth_opt.take() {
+                                let _ = s.write_all(b"invalid_key_len").await;
+                                let _ = s.finish();
+                            }
+                            return Err(anyhow::anyhow!(
+                                "Protocol error: new client key size {} exceeds limit of 256",
+                                key_len
+                            ));
+                        }
+                        let mut key_bytes = vec![0; key_len as usize];
+                        recv_auth.read_exact(&mut key_bytes).await?;
+                        key_bytes
+                    }
+                    _ => return Err(anyhow::anyhow!("Incompatible protocol version or malformed handshake")),
+                }
+            }
+
             Err(e) => {
                 error!("Failed to read initial handshake bytes: {}", e);
                 return Err(e.into());
@@ -185,24 +195,41 @@ impl QuiverInstance {
         let api_key = String::from_utf8(api_key_bytes)?;
 
         // --- Authentication ---
-        match self.authenticator.authenticate(&api_key).await {
-            Ok((account_information, guard)) => {
-                self.account_information = Some(account_information);
-                self.connection_guard = Some(guard);
-                self.api_key = Some(api_key);
+        let auth_result = self.authenticator.authenticate(&api_key).await;
+        // We must reply on the AUTH stream (legacy: first stream; new: dedicated auth stream)
+        if let Some(mut send_auth) = send_auth_opt.take() {
+            match auth_result {
+                Ok((account_information, guard)) => {
+                    self.account_information = Some(account_information);
+                    self.connection_guard = Some(guard);
+                    self.api_key = Some(api_key);
+                    send_auth.write_all(b"authenticated").await?;
+                    send_auth.finish()?;
+                }
+                Err(e) => {
+                    let _ = send_auth.write_all(b"unauthorized").await;
+                    let _ = send_auth.finish();
+                    return Err(e);
+                }
             }
-            Err(e) => return Err(e),
+        } else {
+            // Shouldn't happen: we always set send_auth in both branches
+            return Err(anyhow::anyhow!("internal: missing auth send stream"));
         }
 
-        // --- Device Info ---
+        // --- Device Info (next bidi stream) ---
         if !self.handle_device_info_stream().await? {
             return Err(anyhow::anyhow!("Device info rejected"));
         }
 
         let truncated_api_key = self.api_key.as_ref().unwrap().chars().rev().take(8).collect::<String>();
-        info!("{:?} device key {:?} put to work", self.account_information.as_ref().unwrap().user_uuid, truncated_api_key);
+        info!(
+            "{:?} device key {:?} put to work",
+            self.account_information.as_ref().unwrap().user_uuid,
+            truncated_api_key
+        );
 
-        // --- Ready for work ---
+        // --- Work loop ---
         self.handle_work().await
     }
 }
