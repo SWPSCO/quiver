@@ -14,7 +14,7 @@ use crate::types::{Template, Submission, SubmissionResponse};
 use crate::new_job::NewJobConsumer;
 use crate::submission::{SubmissionProvider, SubmissionResponseHandler};
 use crate::insecure::SkipServerVerification;
-
+use crate::types::CURRENT_VERSION;
 
 #[derive(Debug)]
 pub struct QuiverClient {
@@ -45,7 +45,27 @@ impl QuiverClient {
         }
     }
 
+    async fn perform_version_handshake(&self) -> Result<()> {
+        info!("Negotiating protocol version...");
+        let (mut send_version, mut recv_version) = self.conn.open_bi().await?;
+
+        let ver_bytes = bincode::serialize(&CURRENT_VERSION)?;
+        send_version.write_u32(ver_bytes.len() as u32).await?;
+        send_version.write_all(&ver_bytes).await?;
+        send_version.finish()?;
+
+        let response = String::from_utf8(recv_version.read_to_end(100).await?)?;
+        if response != "ok" {
+            return Err(anyhow::anyhow!("Protocol negotiation failed: {}", response));
+        }
+
+        info!("Protocol version compatible with server.");
+        Ok(())
+    }
+
     async fn serve(&mut self) -> Result<()> {
+        // attempt version handshake
+        self.perform_version_handshake().await?;
         // --- Authentication Transaction ---
         info!("authenticating...");
         let (mut send_auth, mut recv_auth) = self.conn.open_bi().await?;

@@ -1,4 +1,4 @@
-use tracing::{info, error};
+use tracing::{info, warn, error};
 use anyhow::Result;
 use quinn::{ServerConfig, Endpoint, Connection, TransportConfig};
 use std::net::SocketAddr;
@@ -14,6 +14,7 @@ use crate::device_info::{DeviceInfo, DeviceInfoUpdater};
 use crate::new_job::NewJobProvider;
 use crate::types::{Template, Submission, SubmissionResponse, AccountInformation};
 use crate::submission::SubmissionConsumer;
+use crate::types::{CURRENT_VERSION, ProtocolVersion};
 
 struct QuiverInstance {
     conn: Connection,
@@ -43,34 +44,6 @@ impl QuiverInstance {
             device_info_updater,
             new_job_provider,
             submission_consumer,
-        }
-    }
-
-    async fn handle_auth_stream(&mut self) -> Result<bool> {
-        let Ok((mut send, mut recv)) = self.conn.accept_bi().await else {
-            return Err(anyhow::anyhow!("connection closed before auth"));
-        };
-        let len = recv.read_u32().await?;
-        if len == 0 {
-            return Err(anyhow::anyhow!("Received an empty API key."));
-        }
-        let mut api_key_bytes = vec![0; len as usize];
-        recv.read_exact(&mut api_key_bytes).await?;
-        let api_key = String::from_utf8(api_key_bytes)?;
-        match self.authenticator.authenticate(&api_key).await {
-            Ok((account_information, guard)) => {
-                self.account_information = Some(account_information);
-                self.connection_guard = Some(guard);
-                self.api_key = Some(api_key);
-                send.write_all(b"authenticated").await?;
-                send.finish()?;
-                Ok(true)
-            }
-            Err(_) => {
-                send.write_all(b"rejected").await?;
-                send.finish()?;
-                Ok(false)
-            }
         }
     }
 
@@ -157,22 +130,79 @@ impl QuiverInstance {
     }
 
     async fn serve(&mut self) -> Result<()> {
-        // The first stream MUST be for authentication.
-        if !self.handle_auth_stream().await? {
-            // If auth fails, we close the connection immediately.
-            return Err(anyhow::anyhow!("Authentication failed"));
+        // The first stream must handle both versioning and auth for backward compatibility
+        let (mut send, mut recv) = self.conn.accept_bi().await?;
+        // heuristic to determine whether this is a handshake or legacy auth attempt
+        let initial_bytes = recv.read_u32().await;
+        const TOKEN_PREFIX: u32 = 1852793707;
+
+        // We should remove this in the future
+        let api_key_bytes = match initial_bytes {
+            Ok(TOKEN_PREFIX) => {
+                warn!("Legacy authentication, no version handshake. Please update your miner!");
+                let mut key_bytes = TOKEN_PREFIX.to_be_bytes().to_vec();
+                key_bytes.extend(recv.read_to_end(50 - 4).await?);
+                key_bytes
+            },
+            // assume this is a version handshake
+            Ok(len) => {
+                if len > 0 && len < 100 {
+                    let mut ver_bytes = vec![0; len as usize];
+                    match recv.read_exact(&mut ver_bytes).await {
+                        Ok(_) => {
+                            match bincode::deserialize::<ProtocolVersion>(&ver_bytes) {
+                                // Deserialized correctly and the major version matches
+                                // If we have incompatible protocol changes in the future, fork here
+                                Ok(client_version) if client_version.major == CURRENT_VERSION.major => {
+                                    info!("Handshake successful: v{}.{}.{}", client_version.major, client_version.minor, client_version.patch);
+                                    send.write_all(b"ok").await?;
+                                    send.finish()?;
+                                    let (_send_auth, mut recv_auth) = self.conn.accept_bi().await?;
+                                    let key_len = recv_auth.read_u32().await?;
+                                    // Check length
+                                    if key_len > 256 {
+                                        return Err(anyhow::anyhow!("Protocol error: new client key size of {} exceeds limit of 256", key_len));
+                                    }
+                                    let mut key_bytes = vec![0; key_len as usize];
+                                    recv_auth.read_exact(&mut key_bytes).await?;
+                                    key_bytes
+                                },
+                                _ => return Err(anyhow::anyhow!("Incompatible protocol version or malformed handshake")),
+                            }
+                        },
+                        Err(_) => return Err(anyhow::anyhow!("Malformed protocol handshake. Please update your miner.")),
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Invalid protocol handshake length: {}", len));
+                }
+            },
+            Err(e) => {
+                error!("Failed to read initial handshake bytes: {}", e);
+                return Err(e.into());
+            }
+        };
+
+        let api_key = String::from_utf8(api_key_bytes)?;
+
+        // --- Authentication ---
+        match self.authenticator.authenticate(&api_key).await {
+            Ok((account_information, guard)) => {
+                self.account_information = Some(account_information);
+                self.connection_guard = Some(guard);
+                self.api_key = Some(api_key);
+            }
+            Err(e) => return Err(e),
         }
 
-        // After auth, receive device info.
+        // --- Device Info ---
         if !self.handle_device_info_stream().await? {
             return Err(anyhow::anyhow!("Device info rejected"));
         }
 
-        // take the last 8 characters of the api key
         let truncated_api_key = self.api_key.as_ref().unwrap().chars().rev().take(8).collect::<String>();
-        info!("{:?} put to work with key {:?}", self.account_information.as_ref().unwrap().user_uuid, truncated_api_key);
+        info!("{:?} device key {:?} put to work", self.account_information.as_ref().unwrap().user_uuid, truncated_api_key);
 
-        // Ready for work.
+        // --- Ready for work ---
         self.handle_work().await
     }
 }
