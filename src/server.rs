@@ -127,9 +127,12 @@ impl QuiverInstance {
                     }
                 };
 
-                let mut buf = vec![0; len as usize];
-                recv_submission.read_exact(&mut buf).await.expect("failed to read submission");
-                let submission: Submission = bincode::deserialize(&buf).expect("failed to deserialize submission");
+                let submission: Submission = {
+                    let mut buf = vec![0; len as usize];
+                    recv_submission.read_exact(&mut buf).await.expect("failed to read submission");
+                    bincode::deserialize(&buf).expect("failed to deserialize submission")
+                    // buf is dropped here, freeing ~110KB immediately
+                };
 
                 let Some(account_information) = account_information.clone() else {
                     error!("no account information");
