@@ -92,6 +92,20 @@ impl SubmissionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnnouncementResponse {
+    pub accepted: bool,
+    pub digest: Bytes,
+    pub coins: u64,
+    pub message: String,
+}
+
+impl AnnouncementResponse {
+    pub fn new(accepted: bool, digest: Bytes, coins: u64, message: String) -> Self {
+        Self { accepted, digest, coins, message }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Announcement {
     pub commit: Bytes,
     pub digest: Bytes,
