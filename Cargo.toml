@@ -16,5 +16,5 @@ uuid = { version = "1.6.1", features = ["v4", "serde"] }
 bytes = { version = "1.10.1" }
 
 # nockchain
-nockchain-libp2p-io = { git = "https://github.com/swpsco/nockchain.git", rev = "07a0e56", package = "nockchain-libp2p-io" }
-nockapp = { git = "https://github.com/swpsco/nockchain.git", rev = "07a0e56", package = "nockapp" }
+nockchain-libp2p-io = { git = "https://github.com/swpsco/nockchain.git", rev = "9eb98e9324e3101f16f38346cd5ace73d7e30adf", package = "nockchain-libp2p-io" }
+nockapp = { git = "https://github.com/swpsco/nockchain.git", rev = "9eb98e9324e3101f16f38346cd5ace73d7e30adf", package = "nockapp" }
