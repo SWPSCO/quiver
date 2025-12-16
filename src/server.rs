@@ -51,7 +51,20 @@ impl QuiverInstance {
             return Err(anyhow::anyhow!("connection closed before auth"));
         };
 
-        let api_key = String::from_utf8(recv.read_to_end(50).await?)?;
+        let raw_data = recv.read_to_end(50).await?;
+
+        // Check if this looks like an API key (valid UTF-8, reasonable length)
+        // If not, client is probably sending on a stale connection thinking it's already authed
+        let api_key = match String::from_utf8(raw_data) {
+            Ok(s) if !s.is_empty() && s.len() <= 50 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => s,
+            _ => {
+                // Send reconnect signal and close - client is confused about connection state
+                send.write_all(b"reconnect").await?;
+                send.finish()?;
+                self.conn.close(1u32.into(), b"stale connection - please reconnect");
+                return Err(anyhow::anyhow!("received non-API-key data on auth stream - client has stale connection"));
+            }
+        };
 
         match self.authenticator.authenticate(&api_key).await {
             Ok((account_information, guard)) => {
@@ -62,7 +75,8 @@ impl QuiverInstance {
                 send.finish()?;
                 Ok(true)
             }
-            Err(_) => {
+            Err(e) => {
+                error!("Auth rejected for key {}...: {}", &api_key[..8.min(api_key.len())], e);
                 send.write_all(b"rejected").await?;
                 send.finish()?;
                 Ok(false)

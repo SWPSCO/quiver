@@ -155,13 +155,13 @@ pub async fn run(
     let mut endpoint = Endpoint::client(SocketAddr::from_str(&client_address)?)?;
 
     let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(10))); // send pingz
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
     transport.max_idle_timeout(Some(
         IdleTimeout::try_from(Duration::from_secs(120)).expect("idle-timeout range")
     ));
     let transport = Arc::new(transport);
 
-    // build client config then attach the transport
+    // Build client config with transport settings
     let mut client_cfg = if !insecure {
         ClientConfig::with_platform_verifier()
     } else {
@@ -172,21 +172,7 @@ pub async fn run(
         ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?))
     };
     client_cfg.transport_config(transport);
-
     endpoint.set_default_client_config(client_cfg);
-
-    if !insecure {
-        let config = ClientConfig::with_platform_verifier();
-        endpoint.set_default_client_config(config);
-    } else {
-        let crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(SkipServerVerification::new())
-            .with_no_client_auth();
-        endpoint.set_default_client_config(ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(crypto)?,
-        )));
-    }
 
     let remote_address = tokio::net::lookup_host(server_address.as_str())
         .await?
