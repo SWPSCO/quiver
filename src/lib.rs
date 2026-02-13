@@ -1,8 +1,9 @@
-pub mod server;
-pub mod client;
 pub mod auth;
+pub mod client;
 pub mod device_info;
-pub mod new_job;
-pub mod submission;
-pub mod types;
 pub mod insecure;
+pub mod new_job;
+pub mod server;
+pub mod submission;
+pub mod telemetry;
+pub mod types;
