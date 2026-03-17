@@ -1,20 +1,20 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, error};
+use tracing::{debug, error, info, warn};
 
 use crate::device_info::DeviceInfo;
-use crate::types::{Template, Submission, SubmissionResponse};
+use crate::insecure::SkipServerVerification;
 use crate::new_job::NewJobConsumer;
 use crate::submission::{SubmissionProvider, SubmissionResponseHandler};
-use crate::insecure::SkipServerVerification;
-
+use crate::telemetry::{TelemetryProvider, TELEMETRY_FRAME_MAX_BYTES, TELEMETRY_STREAM_MARKER};
+use crate::types::{Submission, SubmissionResponse, Template};
 
 #[derive(Debug)]
 pub struct QuiverClient {
@@ -24,6 +24,7 @@ pub struct QuiverClient {
     new_job_consumer: Arc<dyn NewJobConsumer>,
     submission_provider: Arc<dyn SubmissionProvider>,
     submission_response_handler: Arc<dyn SubmissionResponseHandler>,
+    telemetry_provider: Option<Arc<dyn TelemetryProvider>>,
 }
 
 impl QuiverClient {
@@ -34,6 +35,7 @@ impl QuiverClient {
         new_job_consumer: Arc<dyn NewJobConsumer>,
         submission_provider: Arc<dyn SubmissionProvider>,
         submission_response_handler: Arc<dyn SubmissionResponseHandler>,
+        telemetry_provider: Option<Arc<dyn TelemetryProvider>>,
     ) -> Self {
         Self {
             conn,
@@ -42,6 +44,7 @@ impl QuiverClient {
             new_job_consumer,
             submission_provider,
             submission_response_handler,
+            telemetry_provider,
         }
     }
 
@@ -59,7 +62,9 @@ impl QuiverClient {
         // --- Device Info Transaction ---
         info!("sending device info...");
         let (mut send_device, mut recv_device) = self.conn.open_bi().await?;
-        send_device.write_all(&bincode::serialize(&self.device_info)?).await?;
+        send_device
+            .write_all(&bincode::serialize(&self.device_info)?)
+            .await?;
         send_device.finish()?;
         let device_res = String::from_utf8(recv_device.read_to_end(50).await?)?;
         if device_res != "accepted" {
@@ -68,8 +73,20 @@ impl QuiverClient {
 
         info!("Client authenticated and ready for work.");
 
+        // Telemetry stream is intentionally best-effort and detached.
+        //
+        // If telemetry transport fails for any reason, mining and share submission
+        // must continue uninterrupted. The background task handles retries and
+        // stream re-open logic internally.
+        if let Some(provider) = self.telemetry_provider.clone() {
+            tokio::spawn(run_telemetry_stream(self.conn.clone(), provider));
+        }
+
         // Spawn the background task to receive new jobs.
-        let mut job_handle = tokio::spawn(receive_jobs(self.conn.clone(), self.new_job_consumer.clone()));
+        let mut job_handle = tokio::spawn(receive_jobs(
+            self.conn.clone(),
+            self.new_job_consumer.clone(),
+        ));
 
         loop {
             tokio::select! {
@@ -119,15 +136,118 @@ impl QuiverClient {
     }
 }
 
+/// Drive the long-lived telemetry stream over quiver.
+///
+/// This function intentionally never returns an error to callers. It loops and
+/// self-recovers until the main connection closes.
+async fn run_telemetry_stream(conn: Connection, provider: Arc<dyn TelemetryProvider>) {
+    let reopen_backoff = Duration::from_secs(2);
+    let provider_error_backoff = Duration::from_secs(1);
+
+    loop {
+        // If the connection closes, this branch wins and the telemetry task exits.
+        let stream_result = tokio::select! {
+            _ = conn.closed() => {
+                debug!("Telemetry stream task exiting: connection closed");
+                return;
+            }
+            stream = conn.open_bi() => stream,
+        };
+
+        let (mut send, _recv) = match stream_result {
+            Ok(parts) => parts,
+            Err(e) => {
+                warn!("Telemetry stream open failed, retrying: {}", e);
+                tokio::select! {
+                    _ = conn.closed() => return,
+                    _ = tokio::time::sleep(reopen_backoff) => {}
+                }
+                continue;
+            }
+        };
+
+        // The first byte is a stream discriminator so the server can demultiplex
+        // telemetry vs legacy submission streams without breaking old clients.
+        if let Err(e) = send.write_u8(TELEMETRY_STREAM_MARKER).await {
+            warn!("Failed to write telemetry marker, reopening stream: {}", e);
+            tokio::select! {
+                _ = conn.closed() => return,
+                _ = tokio::time::sleep(reopen_backoff) => {}
+            }
+            continue;
+        }
+
+        debug!("Telemetry stream established");
+
+        loop {
+            // Wait for either connection closure or the next telemetry sample.
+            let next_sample = tokio::select! {
+                _ = conn.closed() => {
+                    debug!("Telemetry stream task exiting: connection closed");
+                    return;
+                }
+                sample = provider.next_telemetry() => sample,
+            };
+
+            let telemetry = match next_sample {
+                Ok(sample) => sample,
+                Err(e) => {
+                    // Provider-side failures are treated as transient.
+                    warn!("Telemetry provider failed to produce sample: {}", e);
+                    tokio::time::sleep(provider_error_backoff).await;
+                    continue;
+                }
+            };
+
+            let payload = match bincode::serialize(&telemetry) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    warn!("Failed to serialize telemetry sample: {}", e);
+                    continue;
+                }
+            };
+
+            if payload.len() as u32 > TELEMETRY_FRAME_MAX_BYTES {
+                warn!(
+                    "Telemetry frame too large ({} bytes > {} bytes), dropping sample",
+                    payload.len(),
+                    TELEMETRY_FRAME_MAX_BYTES
+                );
+                continue;
+            }
+
+            // Frame format: [u32 payload_len][payload_bytes]
+            // We keep this compact and binary for low overhead under steady load.
+            if let Err(e) = send.write_u32(payload.len() as u32).await {
+                warn!("Telemetry stream write(length) failed: {}", e);
+                break;
+            }
+            if let Err(e) = send.write_all(&payload).await {
+                warn!("Telemetry stream write(payload) failed: {}", e);
+                break;
+            }
+        }
+
+        // The current stream is broken; close locally and reopen on next loop.
+        let _ = send.finish();
+        tokio::select! {
+            _ = conn.closed() => return,
+            _ = tokio::time::sleep(reopen_backoff) => {}
+        }
+    }
+}
+
 /// Handle the network I/O for a single submission.
 async fn handle_one_submission(
     conn: Connection,
     submission: Submission,
-    handler: Arc<dyn SubmissionResponseHandler>
+    handler: Arc<dyn SubmissionResponseHandler>,
 ) -> Result<()> {
     let (mut send_submission, mut recv_submission) = conn.open_bi().await?;
     let submission_bytes = bincode::serialize(&submission)?;
-    send_submission.write_u32(submission_bytes.len() as u32).await?;
+    send_submission
+        .write_u32(submission_bytes.len() as u32)
+        .await?;
     send_submission.write_all(&submission_bytes).await?;
     send_submission.finish()?;
 
@@ -140,7 +260,6 @@ async fn handle_one_submission(
     Ok(())
 }
 
-
 pub async fn run(
     insecure: bool,
     server_address: String,
@@ -151,13 +270,42 @@ pub async fn run(
     submission_provider: Arc<dyn SubmissionProvider>,
     submission_response_handler: Arc<dyn SubmissionResponseHandler>,
 ) -> Result<()> {
+    run_with_telemetry(
+        insecure,
+        server_address,
+        client_address,
+        key,
+        device_info,
+        new_job_consumer,
+        submission_provider,
+        submission_response_handler,
+        None,
+    )
+    .await
+}
+
+/// Start a quiver client with optional telemetry streaming support.
+///
+/// This is a superset of `run()` and preserves backward compatibility by letting
+/// existing callers pass `None` for telemetry.
+pub async fn run_with_telemetry(
+    insecure: bool,
+    server_address: String,
+    client_address: String,
+    key: String,
+    device_info: DeviceInfo,
+    new_job_consumer: Arc<dyn NewJobConsumer>,
+    submission_provider: Arc<dyn SubmissionProvider>,
+    submission_response_handler: Arc<dyn SubmissionResponseHandler>,
+    telemetry_provider: Option<Arc<dyn TelemetryProvider>>,
+) -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut endpoint = Endpoint::client(SocketAddr::from_str(&client_address)?)?;
 
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(10))); // send pingz
     transport.max_idle_timeout(Some(
-        IdleTimeout::try_from(Duration::from_secs(120)).expect("idle-timeout range")
+        IdleTimeout::try_from(Duration::from_secs(120)).expect("idle-timeout range"),
     ));
     let transport = Arc::new(transport);
 
@@ -172,21 +320,7 @@ pub async fn run(
         ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?))
     };
     client_cfg.transport_config(transport);
-
     endpoint.set_default_client_config(client_cfg);
-
-    if !insecure {
-        let config = ClientConfig::with_platform_verifier();
-        endpoint.set_default_client_config(config);
-    } else {
-        let crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(SkipServerVerification::new())
-            .with_no_client_auth();
-        endpoint.set_default_client_config(ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(crypto)?,
-        )));
-    }
 
     let remote_address = tokio::net::lookup_host(server_address.as_str())
         .await?
@@ -201,16 +335,25 @@ pub async fn run(
 
     info!("Connecting to nockpool at {}", server_address);
 
-    let connection = endpoint
-        .connect(remote_address, host)?
-        .await?;
+    let connection = endpoint.connect(remote_address, host)?.await?;
 
     info!("Connected to nockpool at {}", server_address);
-    let mut client = QuiverClient::new(connection, key, device_info, new_job_consumer, submission_provider, submission_response_handler);
+    let mut client = QuiverClient::new(
+        connection,
+        key,
+        device_info,
+        new_job_consumer,
+        submission_provider,
+        submission_response_handler,
+        telemetry_provider,
+    );
     client.serve().await
 }
 
-async fn receive_jobs(conn: quinn::Connection, new_job_consumer: Arc<dyn NewJobConsumer>) -> Result<()> {
+async fn receive_jobs(
+    conn: quinn::Connection,
+    new_job_consumer: Arc<dyn NewJobConsumer>,
+) -> Result<()> {
     loop {
         let mut recv = match conn.accept_uni().await {
             Ok(s) => {
@@ -223,17 +366,18 @@ async fn receive_jobs(conn: quinn::Connection, new_job_consumer: Arc<dyn NewJobC
             }
         };
 
-        // read frames from this stream until the server finishes 
+        // read frames from this stream until the server finishes
         // or resets it then go back up and accept the next job stream.
         loop {
             let len = match recv.read_u32().await {
                 Ok(len) => len,
                 Err(e) => {
                     // distinguish eof vs reset vs connection-closed for diagnostics
-                    use std::error::Error as _;
                     let mut src = (&e as &dyn std::error::Error).source();
                     while let Some(inner) = src {
-                        if let Some(quinn::ReadError::Reset(code)) = inner.downcast_ref::<quinn::ReadError>() {
+                        if let Some(quinn::ReadError::Reset(code)) =
+                            inner.downcast_ref::<quinn::ReadError>()
+                        {
                             tracing::warn!("job stream reset by peer: {code:?}");
                             break;
                         }
