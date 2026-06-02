@@ -2,6 +2,7 @@ use nockchain_libp2p_io::tip5_util::tip5_hash_to_base58;
 use serde::{Deserialize, Serialize};
 use bytes::Bytes;
 use nockapp::noun::slab::NounSlab;
+use nockvm::noun::NounAllocator;
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -31,7 +32,8 @@ impl Template {
     pub fn commit_as_base58(&self) -> Result<String, anyhow::Error> {
         let mut slab: NounSlab = NounSlab::new();
         let commit = slab.cue_into(self.commit.clone().into()).map_err(|_| anyhow::anyhow!("Failed to cue commit"))?;
-        tip5_hash_to_base58(commit).map_err(|_| anyhow::anyhow!("Failed to convert commit to base58"))
+        let space = slab.noun_space();
+        tip5_hash_to_base58(commit, &space).map_err(|_| anyhow::anyhow!("Failed to convert commit to base58"))
     }
 }
 
@@ -59,7 +61,8 @@ impl TemplateInternal {
     pub fn commit_as_base58(&self) -> Result<String, anyhow::Error> {
         let mut slab: NounSlab = NounSlab::new();
         let commit = slab.cue_into(self.commit.clone().into()).map_err(|_| anyhow::anyhow!("Failed to cue commit"))?;
-        tip5_hash_to_base58(commit).map_err(|_| anyhow::anyhow!("Failed to convert commit to base58"))
+        let space = slab.noun_space();
+        tip5_hash_to_base58(commit, &space).map_err(|_| anyhow::anyhow!("Failed to convert commit to base58"))
     }
 }
 
