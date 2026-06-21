@@ -4,6 +4,15 @@ use bytes::Bytes;
 use nockapp::noun::slab::NounSlab;
 use uuid::Uuid;
 
+pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 0, minor: 2, patch: 0 };
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct ProtocolVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AccountInformation {
     pub user_uuid: Uuid,
